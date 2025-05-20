@@ -2,6 +2,7 @@ import os
 import numpy as np
 import cv2
 import json
+from collections import Counter
 from tensorflow.keras.models import load_model
 from tensorflow.keras import layers, Model, Input, optimizers
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -21,9 +22,9 @@ BATCH_SIZE     = 64
 EPOCHS         = 20
 TEST_SIZE      = 0.2
 RANDOM_STATE   = 42
+AUG_FACTOR     = 10  # how many augmented samples per real sample
 
 def load_image_paths(data_dir):
-    # list only directories, sorted numerically
     subdirs = sorted(
         [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))],
         key=lambda x: int(x)
@@ -35,8 +36,7 @@ def load_image_paths(data_dir):
             if fn.lower().endswith(('.png', '.jpg', '.jpeg')):
                 paths.append(os.path.join(folder, fn))
                 labels.append(idx)
-    class_names = subdirs
-    return np.array(paths), np.array(labels), class_names
+    return np.array(paths), np.array(labels), subdirs
 
 def preprocess_image(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
@@ -46,29 +46,65 @@ def preprocess_image(path):
     return img[..., None]
 
 def main():
-     # ─── LOAD & FREEZE BASE MODEL ────────────────────────────────────────────
+    # ─── 1) LOAD & PREP DATA ────────────────────────────────────────────────
+    paths, labels, class_names = load_image_paths(ODIA_DIR)
+    idx = np.arange(len(paths))
+    np.random.seed(RANDOM_STATE)
+    np.random.shuffle(idx)
+    paths, labels = paths[idx], labels[idx]
+
+    # ─── STRATIFIED SPLIT ──────────────────────────────────────────────────
+    train_p, val_p, train_l, val_l = train_test_split(
+        paths, labels,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=labels
+    )
+
+    # ─── PRINT CLASS DISTRIBUTIONS ─────────────────────────────────────────
+    print("Train class counts:", Counter(train_l))
+    print("Val   class counts:", Counter(val_l))
+
+    X_train = np.stack([preprocess_image(p) for p in train_p])
+    y_train = train_l
+    X_val   = np.stack([preprocess_image(p) for p in val_p])
+    y_val   = val_l
+
+    # ─── OPTIONAL: SANITY-CHECK AUGMENTATIONS ──────────────────────────────
+    # import matplotlib.pyplot as plt
+    # datagen = ImageDataGenerator(rotation_range=360, width_shift_range=0.2,
+    #     height_shift_range=0.2, shear_range=0.2, zoom_range=[0.8,1.2],
+    #     brightness_range=[0.5,1.5], fill_mode='reflect')
+    # fig, axs = plt.subplots(2, 5, figsize=(10,4))
+    # for i in range(5):
+    #     orig = X_train[y_train==i][0].squeeze()
+    #     axs[0,i].imshow(orig, cmap='gray'); axs[0,i].axis('off')
+    #     aug_im = datagen.flow(
+    #         X_train[y_train==i:i+1], batch_size=1
+    #     ).next()[0].squeeze()
+    #     axs[1,i].imshow(aug_im, cmap='gray'); axs[1,i].axis('off')
+    # plt.show()
+
+    # ─── 2) LOAD & FREEZE BASE MODEL ────────────────────────────────────────
+    print("Loading Bengali model:", BENGALI_MODEL)
     base = load_model(BENGALI_MODEL)
     for layer in base.layers:
         layer.trainable = False
 
-    # ─── BUILD A TRUE FEATURE EXTRACTOR ──────────────────────────────────────
-    # We manually apply all layers up to (but excluding) the last 2 layers
-    # (which are Dropout and the final softmax Dense).
-    from tensorflow.keras import Input, Model
-
+    # ─── 3) BUILD FEATURE EXTRACTOR ─────────────────────────────────────────
     inp = Input(shape=(*IMG_SIZE, 1))
     x = inp
     for layer in base.layers[:-2]:
         x = layer(x)
-    feat_extractor = Model(inputs=inp, outputs=x, name="bengali_feature_extractor")
+    feat_extractor = Model(inputs=inp, outputs=x, name="bengali_feat_ext")
 
-    # ─── ATTACH YOUR NEW ODIA CLASSIFIER HEAD ────────────────────────────────
+    # ─── 4) ATTACH ODIA HEAD ────────────────────────────────────────────────
     features = feat_extractor(inp, training=False)
     x = layers.Dense(64, activation='relu')(features)
     x = layers.Dropout(0.5)(x)
     out = layers.Dense(len(class_names), activation='softmax')(x)
 
-    model = Model(inputs=inp, outputs=out, name="odia_transfer_model")
+    model = Model(inputs=inp, outputs=out, name="odia_transfer")
     model.compile(
         optimizer=optimizers.Adam(1e-4),
         loss='sparse_categorical_crossentropy',
@@ -76,43 +112,38 @@ def main():
     )
     model.summary()
 
-    # ─── CALLBACKS ──────────────────────────────────────────────────────────────
-    early_stop = EarlyStopping(
-        monitor='val_loss', patience=5, restore_best_weights=True
-    )
-    reduce_lr = ReduceLROnPlateau(
-        monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6
-    )
-    checkpoint = ModelCheckpoint(
-        OUTPUT_MODEL, monitor='val_loss', save_best_only=True, verbose=1
-    )
+    # ─── 5) CALLBACKS ───────────────────────────────────────────────────────
+    early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    reduce_lr  = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
+    checkpoint = ModelCheckpoint(OUTPUT_MODEL, monitor='val_loss', save_best_only=True, verbose=1)
 
-    # ─── DATA AUGMENTATION ──────────────────────────────────────────────────────
+    # ─── 6) HEAVY AUGMENTATION & TRAIN ─────────────────────────────────────
     datagen = ImageDataGenerator(
-        rotation_range=15,
-        width_shift_range=0.1,
-        height_shift_range=0.1,
-        zoom_range=0.1,
-        shear_range=0.1
+        rotation_range=360,
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        shear_range=0.2,
+        zoom_range=[0.8, 1.2],
+        brightness_range=[0.5, 1.5],
+        fill_mode='reflect'
     )
     datagen.fit(X_train)
 
-    # ─── TRAIN ──────────────────────────────────────────────────────────────────
+    steps = max(1, (len(X_train) * AUG_FACTOR) // BATCH_SIZE)
     history = model.fit(
         datagen.flow(X_train, y_train, batch_size=BATCH_SIZE),
-        steps_per_epoch=max(1, len(X_train) // BATCH_SIZE),
+        steps_per_epoch=steps,
         validation_data=(X_val, y_val),
         epochs=EPOCHS,
         callbacks=[early_stop, reduce_lr, checkpoint],
         verbose=2
     )
 
-    # ─── FINAL EVAL ─────────────────────────────────────────────────────────────
+    # ─── 7) FINAL EVALUATION & SAVE METRICS ────────────────────────────────
     best = load_model(OUTPUT_MODEL)
     loss, acc = best.evaluate(X_val, y_val, verbose=2)
     print(f"Best Odia model → Loss: {loss:.4f}, Acc: {acc:.4f}")
 
-    # ─── SAVE METRICS ──────────────────────────────────────────────────────────
     os.makedirs(MODELS_DIR, exist_ok=True)
     metrics = {
         'history': {k: [float(v) for v in vals] for k, vals in history.history.items()},
@@ -122,8 +153,7 @@ def main():
     }
     with open(os.path.join(MODELS_DIR, f'metrics_odia_{BEST_ID}.json'), 'w') as f:
         json.dump(metrics, f, indent=2)
-
-    print("Saved transfer-learned model and metrics to:", OUTPUT_MODEL)
+    print("Saved model & metrics to:", OUTPUT_MODEL)
 
 if __name__ == "__main__":
     main()
