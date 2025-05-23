@@ -41,6 +41,7 @@ def load_image_paths(data_dir):
 def preprocess_image(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     img = cv2.resize(img, IMG_SIZE)
+    # Ensure consistency with Bengali preprocessing here:
     img = cv2.equalizeHist(img)
     img = img.astype('float32') / 255.0
     return img[..., None]
@@ -61,7 +62,6 @@ def main():
         stratify=labels
     )
 
-    # ─── PRINT CLASS DISTRIBUTIONS ─────────────────────────────────────────
     print("Train class counts:", Counter(train_l))
     print("Val   class counts:", Counter(val_l))
 
@@ -70,26 +70,14 @@ def main():
     X_val   = np.stack([preprocess_image(p) for p in val_p])
     y_val   = val_l
 
-    # ─── OPTIONAL: SANITY-CHECK AUGMENTATIONS ──────────────────────────────
-    # import matplotlib.pyplot as plt
-    # datagen = ImageDataGenerator(rotation_range=360, width_shift_range=0.2,
-    #     height_shift_range=0.2, shear_range=0.2, zoom_range=[0.8,1.2],
-    #     brightness_range=[0.5,1.5], fill_mode='reflect')
-    # fig, axs = plt.subplots(2, 5, figsize=(10,4))
-    # for i in range(5):
-    #     orig = X_train[y_train==i][0].squeeze()
-    #     axs[0,i].imshow(orig, cmap='gray'); axs[0,i].axis('off')
-    #     aug_im = datagen.flow(
-    #         X_train[y_train==i:i+1], batch_size=1
-    #     ).next()[0].squeeze()
-    #     axs[1,i].imshow(aug_im, cmap='gray'); axs[1,i].axis('off')
-    # plt.show()
-
-    # ─── 2) LOAD & FREEZE BASE MODEL ────────────────────────────────────────
+    # ─── 2) LOAD & PARTIALLY UNFREEZE BASE MODEL ───────────────────────────
     print("Loading Bengali model:", BENGALI_MODEL)
     base = load_model(BENGALI_MODEL)
+
     for layer in base.layers:
         layer.trainable = False
+    for layer in base.layers[-10:]:  # Unfreeze last 10 layers
+        layer.trainable = True
 
     # ─── 3) BUILD FEATURE EXTRACTOR ─────────────────────────────────────────
     inp = Input(shape=(*IMG_SIZE, 1))
@@ -98,9 +86,9 @@ def main():
         x = layer(x)
     feat_extractor = Model(inputs=inp, outputs=x, name="bengali_feat_ext")
 
-    # ─── 4) ATTACH ODIA HEAD ────────────────────────────────────────────────
+    # ─── 4) ATTACH STRONGER ODIA HEAD ──────────────────────────────────────
     features = feat_extractor(inp, training=False)
-    x = layers.Dense(64, activation='relu')(features)
+    x = layers.Dense(128, activation='relu')(features)
     x = layers.Dropout(0.5)(x)
     out = layers.Dense(len(class_names), activation='softmax')(x)
 
@@ -117,14 +105,12 @@ def main():
     reduce_lr  = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
     checkpoint = ModelCheckpoint(OUTPUT_MODEL, monitor='val_loss', save_best_only=True, verbose=1)
 
-    # ─── 6) HEAVY AUGMENTATION & TRAIN ─────────────────────────────────────
+    # ─── 6) DATA AUGMENTATION & TRAIN ──────────────────────────────────────
     datagen = ImageDataGenerator(
-        rotation_range=360,
-        width_shift_range=0.2,
-        height_shift_range=0.2,
-        shear_range=0.2,
-        zoom_range=[0.8, 1.2],
-        brightness_range=[0.5, 1.5],
+        rotation_range=15,
+        width_shift_range=0.05,
+        height_shift_range=0.05,
+        zoom_range=0.1,
         fill_mode='reflect'
     )
     datagen.fit(X_train)
