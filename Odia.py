@@ -3,8 +3,8 @@ import numpy as np
 import cv2
 import json
 from collections import Counter
-from tensorflow.keras.models import load_model
-from tensorflow.keras import layers, Model, Input, optimizers
+from tensorflow.keras.models import load_model, Model
+from tensorflow.keras import layers, Input, optimizers
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from sklearn.model_selection import train_test_split
@@ -22,7 +22,9 @@ BATCH_SIZE     = 64
 EPOCHS         = 20
 TEST_SIZE      = 0.2
 RANDOM_STATE   = 42
-AUG_FACTOR     = 10  # how many augmented samples per real sample
+AUG_FACTOR     = 10
+
+# ─── FUNCTIONS ────────────────────────────────────────────────────────────────
 
 def load_image_paths(data_dir):
     subdirs = sorted(
@@ -41,20 +43,19 @@ def load_image_paths(data_dir):
 def preprocess_image(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     img = cv2.resize(img, IMG_SIZE)
-    # Ensure consistency with Bengali preprocessing here:
-    img = cv2.equalizeHist(img)
     img = img.astype('float32') / 255.0
     return img[..., None]
 
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
 def main():
-    # ─── 1) LOAD & PREP DATA ────────────────────────────────────────────────
+    # ─── 1. Load and preprocess data ───────────────────────────────────────
     paths, labels, class_names = load_image_paths(ODIA_DIR)
     idx = np.arange(len(paths))
     np.random.seed(RANDOM_STATE)
     np.random.shuffle(idx)
     paths, labels = paths[idx], labels[idx]
 
-    # ─── STRATIFIED SPLIT ──────────────────────────────────────────────────
     train_p, val_p, train_l, val_l = train_test_split(
         paths, labels,
         test_size=TEST_SIZE,
@@ -70,29 +71,23 @@ def main():
     X_val   = np.stack([preprocess_image(p) for p in val_p])
     y_val   = val_l
 
-    # ─── 2) LOAD & PARTIALLY UNFREEZE BASE MODEL ───────────────────────────
+    # ─── 2. Load Bengali base model ─────────────────────────────────────────
     print("Loading Bengali model:", BENGALI_MODEL)
-    base = load_model(BENGALI_MODEL)
+    base_model = load_model(BENGALI_MODEL)
+    base_model.trainable = False  # freeze all layers
 
-    for layer in base.layers:
-        layer.trainable = False
-    for layer in base.layers[-10:]:  # Unfreeze last 10 layers
-        layer.trainable = True
-
-    # ─── 3) BUILD FEATURE EXTRACTOR ─────────────────────────────────────────
-    inp = Input(shape=(*IMG_SIZE, 1))
+    # ─── 3. Rebuild CNN up to Flatten layer ────────────────────────────────
+    inp = Input(shape=(*IMG_SIZE, 1), name="odia_input")
     x = inp
-    for layer in base.layers[:-2]:
+    for layer in base_model.layers[:-3]:  # exclude Flatten and Dense layers
         x = layer(x)
-    feat_extractor = Model(inputs=inp, outputs=x, name="bengali_feat_ext")
 
-    # ─── 4) ATTACH STRONGER ODIA HEAD ──────────────────────────────────────
-    features = feat_extractor(inp, training=False)
-    x = layers.Dense(128, activation='relu')(features)
+    x = layers.Flatten()(x)  # flatten manually
+    x = layers.Dense(128, activation='relu')(x)
     x = layers.Dropout(0.5)(x)
     out = layers.Dense(len(class_names), activation='softmax')(x)
 
-    model = Model(inputs=inp, outputs=out, name="odia_transfer")
+    model = Model(inputs=inp, outputs=out, name="odia_transfer_model")
     model.compile(
         optimizer=optimizers.Adam(1e-4),
         loss='sparse_categorical_crossentropy',
@@ -100,12 +95,12 @@ def main():
     )
     model.summary()
 
-    # ─── 5) CALLBACKS ───────────────────────────────────────────────────────
+    # ─── 4. Set up callbacks ───────────────────────────────────────────────
     early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
     reduce_lr  = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
     checkpoint = ModelCheckpoint(OUTPUT_MODEL, monitor='val_loss', save_best_only=True, verbose=1)
 
-    # ─── 6) DATA AUGMENTATION & TRAIN ──────────────────────────────────────
+    # ─── 5. Augmentation and training ──────────────────────────────────────
     datagen = ImageDataGenerator(
         rotation_range=15,
         width_shift_range=0.05,
@@ -125,11 +120,12 @@ def main():
         verbose=2
     )
 
-    # ─── 7) FINAL EVALUATION & SAVE METRICS ────────────────────────────────
+    # ─── 6. Final evaluation ───────────────────────────────────────────────
     best = load_model(OUTPUT_MODEL)
     loss, acc = best.evaluate(X_val, y_val, verbose=2)
     print(f"Best Odia model → Loss: {loss:.4f}, Acc: {acc:.4f}")
 
+    # ─── 7. Save training metrics ──────────────────────────────────────────
     os.makedirs(MODELS_DIR, exist_ok=True)
     metrics = {
         'history': {k: [float(v) for v in vals] for k, vals in history.history.items()},
