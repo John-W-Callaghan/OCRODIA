@@ -2,12 +2,15 @@ import os
 import numpy as np
 import cv2
 import json
+import matplotlib.pyplot as plt
 from collections import Counter
 from tensorflow.keras.models import load_model
 from tensorflow.keras import layers, Model, Input, optimizers
+from tensorflow.keras.losses import SparseCategoricalCrossentropy
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
 BASE_DIR       = os.path.abspath(os.getcwd())
@@ -22,7 +25,8 @@ BATCH_SIZE     = 64
 EPOCHS         = 20
 TEST_SIZE      = 0.2
 RANDOM_STATE   = 42
-AUG_FACTOR     = 10  # how many augmented samples per real sample
+AUG_FACTOR     = 10
+
 
 def load_image_paths(data_dir):
     subdirs = sorted(
@@ -38,23 +42,21 @@ def load_image_paths(data_dir):
                 labels.append(idx)
     return np.array(paths), np.array(labels), subdirs
 
+
 def preprocess_image(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     img = cv2.resize(img, IMG_SIZE)
-    # Ensure consistency with Bengali preprocessing here:
-    img = cv2.equalizeHist(img)
     img = img.astype('float32') / 255.0
     return img[..., None]
 
+
 def main():
-    # ─── 1) LOAD & PREP DATA ────────────────────────────────────────────────
     paths, labels, class_names = load_image_paths(ODIA_DIR)
     idx = np.arange(len(paths))
     np.random.seed(RANDOM_STATE)
     np.random.shuffle(idx)
     paths, labels = paths[idx], labels[idx]
 
-    # ─── STRATIFIED SPLIT ──────────────────────────────────────────────────
     train_p, val_p, train_l, val_l = train_test_split(
         paths, labels,
         test_size=TEST_SIZE,
@@ -70,23 +72,20 @@ def main():
     X_val   = np.stack([preprocess_image(p) for p in val_p])
     y_val   = val_l
 
-    # ─── 2) LOAD & PARTIALLY UNFREEZE BASE MODEL ───────────────────────────
     print("Loading Bengali model:", BENGALI_MODEL)
     base = load_model(BENGALI_MODEL)
 
     for layer in base.layers:
         layer.trainable = False
-    for layer in base.layers[-10:]:  # Unfreeze last 10 layers
+    for layer in base.layers[-10:]:
         layer.trainable = True
 
-    # ─── 3) BUILD FEATURE EXTRACTOR ─────────────────────────────────────────
     inp = Input(shape=(*IMG_SIZE, 1))
     x = inp
     for layer in base.layers[:-2]:
         x = layer(x)
     feat_extractor = Model(inputs=inp, outputs=x, name="bengali_feat_ext")
 
-    # ─── 4) ATTACH STRONGER ODIA HEAD ──────────────────────────────────────
     features = feat_extractor(inp, training=False)
     x = layers.Dense(128, activation='relu')(features)
     x = layers.Dropout(0.5)(x)
@@ -100,12 +99,10 @@ def main():
     )
     model.summary()
 
-    # ─── 5) CALLBACKS ───────────────────────────────────────────────────────
     early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
     reduce_lr  = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
     checkpoint = ModelCheckpoint(OUTPUT_MODEL, monitor='val_loss', save_best_only=True, verbose=1)
 
-    # ─── 6) DATA AUGMENTATION & TRAIN ──────────────────────────────────────
     datagen = ImageDataGenerator(
         rotation_range=15,
         width_shift_range=0.05,
@@ -125,10 +122,20 @@ def main():
         verbose=2
     )
 
-    # ─── 7) FINAL EVALUATION & SAVE METRICS ────────────────────────────────
     best = load_model(OUTPUT_MODEL)
     loss, acc = best.evaluate(X_val, y_val, verbose=2)
     print(f"Best Odia model → Loss: {loss:.4f}, Acc: {acc:.4f}")
+
+    preds = model.predict(X_val)
+    top_preds = np.argmax(preds, axis=1)
+
+    cm = confusion_matrix(y_val, top_preds, labels=list(range(len(class_names))))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    fig, ax = plt.subplots(figsize=(10, 10))
+    disp.plot(ax=ax, cmap='viridis', xticks_rotation='vertical')
+    plt.title("Validation Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
 
     os.makedirs(MODELS_DIR, exist_ok=True)
     metrics = {
