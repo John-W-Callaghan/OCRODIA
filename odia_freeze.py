@@ -9,7 +9,7 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from sklearn.model_selection import train_test_split
 
-# ─── CONFIGURATION ────────────────────────────────────────────────────────────
+#CONFIGURATION 
 BASE_DIR       = os.path.abspath(os.getcwd())
 ODIA_DIR       = os.path.join(BASE_DIR, 'odiaData', 'characters')
 MODELS_DIR     = os.path.join(BASE_DIR, 'models')
@@ -24,7 +24,7 @@ TEST_SIZE      = 0.2
 RANDOM_STATE   = 42
 AUG_FACTOR     = 10
 
-# ─── FUNCTIONS ────────────────────────────────────────────────────────────────
+# Functions
 
 def load_image_paths(data_dir):
     subdirs = sorted(
@@ -46,10 +46,10 @@ def preprocess_image(path):
     img = img.astype('float32') / 255.0
     return img[..., None]
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+#Main function
 
 def main():
-    # ─── 1. Load and preprocess data ───────────────────────────────────────
+    # Load and preprocess data
     paths, labels, class_names = load_image_paths(ODIA_DIR)
     idx = np.arange(len(paths))
     np.random.seed(RANDOM_STATE)
